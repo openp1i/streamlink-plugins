@@ -14,7 +14,7 @@ import json
 import re
 import subprocess
 import traceback
-from urllib.parse import urlparse, urlunparse, parse_qs, quote
+from urllib.parse import urlparse, urlunparse, parse_qs
 
 from streamlink.logger import getLogger
 from streamlink.plugin import Plugin, PluginError, pluginmatcher
@@ -405,11 +405,15 @@ class YouTube(Plugin):
                 if videoId is not None:
                     return videoId
 
-    def _get_channel_live_video_id(self, channel_url):
+    def _get_channel_live_video_id(self, channel_id):
         """Extract live video ID from channel page"""
+        channel_url = self._url_channelid_live.format(channel_id=channel_id)
         log.debug(f"Resolving channel live page: {channel_url}")
+        
         try:
-            res = self.session.http.get(channel_url)
+            res = self._get_res(channel_url)
+            content = res.text
+            
             # Try multiple patterns to find the live video ID
             patterns = [
                 r'"videoId":"([\w-]{11})".*?"isLive":true',
@@ -421,16 +425,133 @@ class YouTube(Plugin):
             ]
             
             for pattern in patterns:
-                match = re.search(pattern, res.text)
+                match = re.search(pattern, content)
                 if match:
                     video_id = match.group(1)
-                    log.debug(f"Found video ID: {video_id} using pattern: {pattern}")
+                    log.debug(f"Found video ID: {video_id}")
                     return video_id
                     
             log.debug("No video ID found in channel page")
             return None
+            
         except Exception as e:
             log.error(f"Error fetching channel page: {e}")
+            return None
+
+    def _get_streams_ytdlp(self, url, is_live=False):
+        """Use yt-dlp to get streams - works for both live and VOD"""
+        try:
+            log.info(f"Processing YouTube URL with yt-dlp: {url}")
+
+            # For live streams, prefer HLS format
+            format_str = "best[ext=m3u8]/best" if is_live else "best"
+
+            cmd = [
+                "python3", "-m", "yt_dlp",
+                "--no-playlist",
+                "--skip-download",
+                "--dump-single-json",
+                "--format", format_str,
+                "--no-warnings",
+                "--quiet",
+                url
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                log.error(f"yt-dlp error: {result.stderr[:500]}")
+                return None
+
+            info = json.loads(result.stdout)
+
+            # Set metadata
+            self.id = info.get("id")
+            self.author = info.get("uploader", info.get("channel", "Unknown"))
+            self.title = info.get("title", "YouTube Video")
+            self.category = info.get("categories", ["Unknown"])[0] if info.get("categories") else "Unknown"
+
+            # Check if it's live
+            is_live = info.get("is_live", False)
+            log.info(f"{'Live Stream' if is_live else 'Video'}: {self.title} | Author: {self.author}")
+
+            # Get the stream URL
+            streams = {}
+            headers = {
+                "User-Agent": useragents.CHROME,
+                "Referer": "https://www.youtube.com/",
+                "Origin": "https://www.youtube.com",
+            }
+
+            # Check if we have a direct URL
+            url = info.get("url")
+            if url:
+                if "m3u8" in url:
+                    # HLS stream
+                    if is_live:
+                        streams["live"] = HLSStream(
+                            self.session,
+                            url,
+                            headers=headers,
+                            live_edge=2,
+                            segment_threads=2,
+                            force_restart=True,
+                            timeout=15
+                        )
+                    else:
+                        # Parse variant playlist for VOD HLS
+                        hls_streams = HLSStream.parse_variant_playlist(self.session, url, headers=headers, name_key="pixels")
+                        streams.update(hls_streams)
+                else:
+                    # Direct HTTP stream
+                    streams["best"] = HTTPStream(self.session, url, headers=headers)
+
+            # Check formats if no direct URL
+            if not streams:
+                formats = info.get("formats", [])
+                for fmt in formats:
+                    fmt_url = fmt.get("url")
+                    if not fmt_url:
+                        continue
+                    
+                    height = fmt.get("height", 0)
+                    quality = f"{height}p" if height > 0 else fmt.get("format_note", "unknown")
+                    
+                    if "m3u8" in fmt_url:
+                        if is_live:
+                            streams["live"] = HLSStream(
+                                self.session,
+                                fmt_url,
+                                headers=headers,
+                                live_edge=2,
+                                segment_threads=2,
+                                force_restart=True,
+                                timeout=15
+                            )
+                            break
+                        else:
+                            hls_streams = HLSStream.parse_variant_playlist(self.session, fmt_url, headers=headers, name_key="pixels")
+                            streams.update(hls_streams)
+                            break
+                    else:
+                        streams[quality] = HTTPStream(self.session, fmt_url, headers=headers)
+
+            log.debug(f"Found {len(streams)} streams via yt-dlp")
+            return streams
+
+        except subprocess.TimeoutExpired:
+            log.error("yt-dlp timeout")
+            return None
+        except json.JSONDecodeError as e:
+            log.error(f"Failed to parse yt-dlp JSON: {e}")
+            return None
+        except Exception as e:
+            log.error(f"yt-dlp error: {e}")
             return None
 
     def _extract_shorts_playlist(self, current_video_id):
@@ -725,258 +846,107 @@ class YouTube(Plugin):
             log.error(f"Error handling profile shorts: {e}")
             return None
 
-    def _get_streams_ytdlp(self, url, is_live=False):
-        """Use yt-dlp to get streams - works for both live and VOD"""
-        try:
-            log.info(f"Processing YouTube URL with yt-dlp: {url}")
-
-            # For live streams, prefer HLS format
-            format_str = "best[ext=m3u8]/best" if is_live else "best"
-
-            cmd = [
-                "python3", "-m", "yt_dlp",
-                "--no-playlist",
-                "--skip-download",
-                "--dump-single-json",
-                "--format", format_str,
-                "--no-warnings",
-                "--quiet",
-                url
-            ]
-
-            # Add cookies if available (helps with age-restricted content)
-            try:
-                with open('/tmp/cookies.txt', 'r') as f:
-                    cmd.extend(['--cookies', '/tmp/cookies.txt'])
-            except:
-                pass
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode != 0:
-                log.error(f"yt-dlp error: {result.stderr[:500]}")
-                return None
-
-            info = json.loads(result.stdout)
-
-            # Set metadata
-            self.id = info.get("id")
-            self.author = info.get("uploader", info.get("channel", "Unknown"))
-            self.title = info.get("title", "YouTube Video")
-            self.category = info.get("categories", ["Unknown"])[0] if info.get("categories") else "Unknown"
-
-            # Check if it's live
-            is_live = info.get("is_live", False)
-            log.info(f"{'Live Stream' if is_live else 'Video'}: {self.title} | Author: {self.author}")
-
-            # Get the stream URL
-            streams = {}
-            headers = {
-                "User-Agent": useragents.CHROME,
-                "Referer": "https://www.youtube.com/",
-                "Origin": "https://www.youtube.com",
-            }
-
-            # Check if we have a direct URL
-            url = info.get("url")
-            if url:
-                if "m3u8" in url:
-                    # HLS stream
-                    if is_live:
-                        streams["live"] = HLSStream(
-                            self.session,
-                            url,
-                            headers=headers,
-                            live_edge=2,
-                            segment_threads=2,
-                            force_restart=True,
-                            timeout=15
-                        )
-                    else:
-                        # Parse variant playlist for VOD HLS
-                        hls_streams = HLSStream.parse_variant_playlist(self.session, url, headers=headers)
-                        streams.update(hls_streams)
-                else:
-                    # Direct HTTP stream
-                    streams["best"] = HTTPStream(self.session, url, headers=headers)
-
-            # Check formats if no direct URL
-            if not streams:
-                formats = info.get("formats", [])
-                for fmt in formats:
-                    fmt_url = fmt.get("url")
-                    if not fmt_url:
-                        continue
-                    
-                    height = fmt.get("height", 0)
-                    quality = f"{height}p" if height > 0 else fmt.get("format_note", "unknown")
-                    
-                    if "m3u8" in fmt_url:
-                        if is_live:
-                            streams["live"] = HLSStream(
-                                self.session,
-                                fmt_url,
-                                headers=headers,
-                                live_edge=2,
-                                segment_threads=2,
-                                force_restart=True,
-                                timeout=15
-                            )
-                            break
-                        else:
-                            hls_streams = HLSStream.parse_variant_playlist(self.session, fmt_url, headers=headers)
-                            streams.update(hls_streams)
-                            break
-                    else:
-                        streams[quality] = HTTPStream(self.session, fmt_url, headers=headers)
-
-            log.debug(f"Found {len(streams)} streams via yt-dlp")
-            return streams
-
-        except subprocess.TimeoutExpired:
-            log.error("yt-dlp timeout")
-            return None
-        except json.JSONDecodeError as e:
-            log.error(f"Failed to parse yt-dlp JSON: {e}")
-            return None
-        except Exception as e:
-            log.error(f"yt-dlp error: {e}")
-            return None
-
     def _get_streams(self):
         """Main method - hybrid approach with yt-dlp support"""
-
-        log.debug(f"Processing URL: {self.url}")
         
-        # Log which matchers matched
+        # Get match groups safely
+        match_dict = self.match.groupdict() if self.match else {}
+        
+        # Log which matcher matched
         if self.matches:
-            matcher_names = []
-            for name in ["default", "channel", "channel_id", "embed", "shorthand", "playlist", 
-                        "profile_playlists", "profile_shorts", "shorts", "shorts_playlist"]:
-                if name in self.matches:
-                    matcher_names.append(name)
+            matcher_names = [name for name in self.matches]
             log.debug(f"Matchers: {matcher_names}")
-
-        # Check if this is a live URL that needs yt-dlp
-        is_live_url = False
-        channel_id = None
-        video_id = None
-
-        # Extract based on matcher type
-        if "channel_id" in self.matches:
-            channel_id = self.match.groupdict().get("channel_id")
-            is_live = self.match.groupdict().get("live") is not None
-            log.debug(f"Channel ID URL detected: {channel_id}, live: {is_live}")
+        if match_dict:
+            log.debug(f"Match groups: {match_dict}")
+        
+        # Check for channel live URLs first
+        channel_id = match_dict.get("channel_id") or match_dict.get("channel")
+        live_suffix = match_dict.get("live")
+        
+        if channel_id and live_suffix:
+            log.info(f"Channel live URL detected: {channel_id}")
             
-            if is_live:
-                is_live_url = True
-                # Try to get live video ID first
-                live_url = self._url_channelid_live.format(channel_id=channel_id)
-                video_id = self._get_channel_live_video_id(live_url)
-                
-                if video_id:
-                    # We found a live video, use native method
-                    self.url = self._url_canonical.format(video_id=video_id)
-                else:
-                    # No live video found, use yt-dlp
-                    log.info("No live video ID found, using yt-dlp for channel live")
-                    streams = self._get_streams_ytdlp(self.url, is_live=True)
-                    if streams:
-                        return streams
-                    else:
-                        raise PluginError("Could not get live stream from channel")
-
-        elif "embed" in self.matches and self.match["live_channel"]:
-            channel_id = self.match["live_channel"]
-            log.debug(f"Embed live URL detected: {channel_id}")
-            is_live_url = True
+            # Try to get live video ID from channel
+            resolved_video_id = self._get_channel_live_video_id(channel_id)
             
-            # Try to get live video ID first
-            live_url = self._url_channelid_live.format(channel_id=channel_id)
-            video_id = self._get_channel_live_video_id(live_url)
-            
-            if video_id:
-                self.url = self._url_canonical.format(video_id=video_id)
+            if resolved_video_id:
+                # Convert to watch URL and process normally
+                watch_url = self._url_canonical.format(video_id=resolved_video_id)
+                log.info(f"Resolved to video: {watch_url}")
+                self.url = watch_url
+                # Continue with normal video processing
             else:
-                log.info("No live video ID found, using yt-dlp for embed live")
-                streams = self._get_streams_ytdlp(self.url, is_live=True)
-                if streams:
-                    return streams
-                else:
-                    raise PluginError("Could not get live stream from embed")
-
-        elif "channel" in self.matches and self.match["live"]:
-            channel = self.match["channel"]
-            log.debug(f"Channel live URL detected: {channel}")
-            is_live_url = True
+                # Fall back to yt-dlp for live
+                log.info("Could not resolve live video ID, using yt-dlp")
+                return self._get_streams_ytdlp(self.url, is_live=True)
+        
+        # Check for embed live URLs
+        if "embed" in self.matches and match_dict.get("live_channel"):
+            channel_id = match_dict.get("live_channel")
+            log.info(f"Embed live URL detected: {channel_id}")
             
-            # Try to get live video ID first
-            live_url = f"https://www.youtube.com/@{channel}/live"
-            video_id = self._get_channel_live_video_id(live_url)
+            resolved_video_id = self._get_channel_live_video_id(channel_id)
             
-            if not video_id:
-                # Try channel ID format
-                live_url = f"https://www.youtube.com/channel/{channel}/live"
-                video_id = self._get_channel_live_video_id(live_url)
-            
-            if video_id:
-                self.url = self._url_canonical.format(video_id=video_id)
+            if resolved_video_id:
+                watch_url = self._url_canonical.format(video_id=resolved_video_id)
+                log.info(f"Resolved to video: {watch_url}")
+                self.url = watch_url
             else:
-                log.info("No live video ID found, using yt-dlp for channel live")
-                streams = self._get_streams_ytdlp(self.url, is_live=True)
-                if streams:
-                    return streams
-                else:
-                    raise PluginError("Could not get live stream from channel")
+                log.info("Could not resolve live video ID, using yt-dlp")
+                return self._get_streams_ytdlp(self.url, is_live=True)
 
         # Handle profile shorts URLs first (@username/shorts)
         if self.matches["profile_shorts"]:
             log.info("Profile shorts URL detected, extracting first short video...")
             if not self._handle_profile_shorts():
                 raise PluginError("Could not extract short video from profile")
+            # After extraction, continue with video processing
 
         # Handle profile playlists URLs (@username/playlists)
         if self.matches["profile_playlists"]:
             log.info("Profile playlists URL detected, extracting first playlist...")
             if not self._handle_profile_playlists():
                 raise PluginError("Could not extract playlist from profile")
+            # After extraction, continue with playlist processing
 
         # Handle playlist URLs
         if self.matches["playlist"]:
             log.info("Playlist URL detected, extracting first video...")
             if not self._extract_video_from_playlist():
-                # Try yt-dlp for playlist
-                log.info("Native extraction failed, trying yt-dlp for playlist")
+                # FALLBACK: If all extraction methods fail, try yt-dlp
+                log.info("All extraction methods failed, trying yt-dlp...")
                 streams = self._get_streams_ytdlp(self.url)
                 if streams:
                     return streams
-                raise PluginError("Could not extract video from playlist")
+                raise PluginError(
+                    "Could not extract video from playlist. "
+                    "Try using a direct video URL instead of playlist URL."
+                )
+            # After extraction, continue with regular video processing
 
         # Check if it's a watch URL with playlist parameter
         parsed = urlparse(self.url)
         if parsed.path.startswith('/watch'):
             query = parse_qs(parsed.query)
             if 'list' in query and 'v' in query:
+                # This is a video URL with playlist parameter
+                # Strip the playlist parameter for cleaner processing
                 log.info("Video URL with playlist parameter detected, stripping playlist...")
+                # Keep only the video ID parameter
                 self.url = self._url_canonical.format(video_id=query['v'][0])
 
-        # For regular videos, use native method first
-        log.info("Using native method for video processing")
-        
+        # For everything else, use the official plugin's native method
+        log.info("Using official plugin method for VOD/regular videos")
+
         try:
             res = self._get_res(self.url)
 
-            if (self.matches["channel"] or self.matches["channel_id"]) and not self.match.get("live"):
+            if self.matches["channel"] and not match_dict.get("live"):
                 initial = self._get_data_from_regex(res, self._re_ytInitialData, "initial data")
                 video_id = self._data_video_id(initial)
                 if video_id is None:
                     log.error("Could not find videoId on channel page")
-                    # Fallback to yt-dlp
+                    # Try yt-dlp as fallback
                     streams = self._get_streams_ytdlp(self.url)
                     if streams:
                         return streams
@@ -985,24 +955,25 @@ class YouTube(Plugin):
                 res = self._get_res(self.url)
 
             if not (data := self._get_data_from_api(res)):
-                # Fallback to yt-dlp
-                log.info("Native API failed, trying yt-dlp")
+                # Try yt-dlp as fallback
+                log.info("API failed, trying yt-dlp")
                 streams = self._get_streams_ytdlp(self.url)
                 if streams:
                     return streams
                 return
                 
             status, reason = self._schema_playabilitystatus(data)
+            # assume that there's an error if reason is set (status will still be "OK" for some reason)
             if status != "OK" or reason:
                 log.error(f"Could not get video info - {status}: {reason}")
-                # Fallback to yt-dlp
+                # Try yt-dlp as fallback
                 log.info("Native method failed, trying yt-dlp")
                 streams = self._get_streams_ytdlp(self.url)
                 if streams:
                     return streams
                 return
 
-            # Get video details
+            # the initial player response contains the category data, which the API response does not
             init_player_response = self._get_data_from_regex(res, self._re_ytInitialPlayerResponse, "initial player response")
             if init_player_response:
                 try:
@@ -1016,7 +987,7 @@ class YouTube(Plugin):
 
             log.debug(f"Using video ID: {self.id}")
 
-            # Parse streams
+            # TODO: remove parsing of non-HLS stuff, as we don't support this
             streams = {}
             hls_manifest, formats, adaptive_formats = self._schema_streamingdata(data)
 
@@ -1053,6 +1024,7 @@ class YouTube(Plugin):
             
         except Exception as e:
             log.error(f"Native method error: {e}")
+            log.debug(traceback.format_exc())
             # Fallback to yt-dlp
             log.info("Falling back to yt-dlp")
             return self._get_streams_ytdlp(self.url)
