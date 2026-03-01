@@ -347,83 +347,21 @@ class YouTube(Plugin):
         return parse_json(match.group(1))
 
     def _get_data_from_api(self, res):
-        # Try to get video_id from multiple sources
-        video_id = None
-        
-        # Method 1: From regex match if available
         try:
-            if self.match and "video_id" in self.match.groupdict():
-                video_id = self.match["video_id"]
-                log.debug(f"Got video_id from regex match: {video_id}")
-        except (KeyError, TypeError, IndexError):
-            pass
+            video_id = self.match["video_id"]
+        except (KeyError, TypeError):
+            video_id = None
 
-        # Method 2: From canonical link if method 1 failed
         if video_id is None:
             try:
                 video_id = self._schema_canonical(res.text)
-                log.debug(f"Got video_id from canonical link: {video_id}")
-            except (PluginError, TypeError, AttributeError):
-                pass
+            except (PluginError, TypeError):
+                return
 
-        # Method 3: From initial data for channel/live URLs
-        if video_id is None:
-            try:
-                initial = self._get_data_from_regex(res, self._re_ytInitialData, "initial data for API")
-                if initial:
-                    # Try multiple ways to find video ID in initial data
-                    video_id = self._data_video_id(initial)
-                    if video_id:
-                        log.debug(f"Got video_id from initial data: {video_id}")
-            except Exception as e:
-                log.debug(f"Failed to extract video_id from initial data: {e}")
-
-        # Method 4: Try to extract from the URL directly
-        if video_id is None:
-            # Try to find any video ID in the URL or response
-            url_video_id_match = re.search(r'[&?]v=([\w-]{11})', self.url)
-            if url_video_id_match:
-                video_id = url_video_id_match.group(1)
-                log.debug(f"Got video_id from URL parameters: {video_id}")
-            else:
-                # Look for video ID patterns in the response content
-                content_video_id_match = re.search(r'"videoId":"([\w-]{11})"', res.text[:50000])
-                if content_video_id_match:
-                    video_id = content_video_id_match.group(1)
-                    log.debug(f"Got video_id from response content: {video_id}")
-
-        # Method 5: Try to extract channel ID and use live endpoint
-        if video_id is None:
-            try:
-                if self.matches["channel"]:
-                    channel_match = re.search(r'"channelId":"([\w-]+)"', res.text[:50000])
-                    if channel_match:
-                        channel_id = channel_match.group(1)
-                        log.debug(f"Found channel ID: {channel_id}, will try live endpoint")
-                        # Let the calling method handle this via yt-dlp fallback
-                        return None
-            except Exception:
-                pass
-
-        # If still no video_id, try to use yt-dlp as fallback for live channels
-        if video_id is None:
-            if self.matches["channel"] and self.match and self.match.groupdict().get("live"):
-                log.info("No video_id found via regex, trying yt-dlp for live channel")
-                # Let the yt-dlp method handle it
-                return None
-
-        if video_id is None:
-            log.error("Could not extract video_id from any source")
-            return None
-
-        # Get API key
         if m := re.search(r"""(?P<q1>["'])INNERTUBE_API_KEY(?P=q1)\s*:\s*(?P<q2>["'])(?P<data>.+?)(?P=q2)""", res.text):
             api_key = m.group("data")
         else:
             api_key = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-
-        log.debug(f"Using API key: {api_key[:10]}...")
-        log.debug(f"Making API request for video_id: {video_id}")
 
         return self.session.http.post(
             "https://www.youtube.com/youtubei/v1/player",
@@ -758,8 +696,8 @@ class YouTube(Plugin):
         try:
             # Check if this is a live-specific URL
             is_live_url = (
-                (self.matches["channel"] and self.match and self.match.groupdict().get("live")) or
-                (self.matches["embed"] and self.match and self.match.groupdict().get("live")) or
+                self.matches["channel"] and self.match["live"] or
+                self.matches["embed"] and self.match["live"] or
                 "/live/" in self.url
             )
 
@@ -898,13 +836,9 @@ class YouTube(Plugin):
 
         # FIRST: Try yt-dlp ONLY for confirmed live streams
         # (channel/live, embed/live, or URLs containing /live/)
-        is_live_url = (
-            (self.matches["channel"] and self.match and self.match.groupdict().get("live")) or
-            (self.matches["embed"] and self.match and self.match.groupdict().get("live")) or
-            "/live/" in self.url
-        )
-        
-        if is_live_url:
+        if (self.matches["channel"] and self.match["live"]) or \
+           (self.matches["embed"] and self.match["live"]) or \
+           "/live/" in self.url:
             log.info("Live URL detected, trying yt-dlp first...")
             streams = self._get_streams_ytdlp_live_only()
             if streams:
@@ -919,7 +853,7 @@ class YouTube(Plugin):
 
         res = self._get_res(self.url)
 
-        if self.matches["channel"] and not (self.match and self.match.groupdict().get("live")):
+        if self.matches["channel"] and not self.match["live"]:
             initial = self._get_data_from_regex(res, self._re_ytInitialData, "initial data")
             video_id = self._data_video_id(initial)
             if video_id is None:
@@ -929,13 +863,6 @@ class YouTube(Plugin):
             res = self._get_res(self.url)
 
         if not (data := self._get_data_from_api(res)):
-            # If API method fails for live channel, try yt-dlp
-            if self.matches["channel"] and self.match and self.match.groupdict().get("live"):
-                log.info("API method failed for live channel, trying yt-dlp...")
-                streams = self._get_streams_ytdlp_live_only()
-                if streams:
-                    return streams
-            log.error("Could not get video data from API")
             return
         status, reason = self._schema_playabilitystatus(data)
         # assume that there's an error if reason is set (status will still be "OK" for some reason)
