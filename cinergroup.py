@@ -66,14 +66,14 @@ class CinerGroup(Plugin):
     def _get_streams(self):
         # Configure HLS settings for better stability
         self._configure_hls_settings()
-        
+
         root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
         schema_getters = self._schema_videourl, self._schema_data_ht
         stream_url = next((res for res in (getter().validate(root) for getter in schema_getters) if res), None)
 
         if stream_url:
             return HLSStream.parse_variant_playlist(self.session, stream_url)
-    
+
     def _configure_hls_settings(self):
         """Configure HLS settings for Turkish streams stability"""
         # Buffer and timeout settings
@@ -84,15 +84,15 @@ class CinerGroup(Plugin):
         self.session.options.set("hls-segment-threads", 4)  # Parallel downloads
         self.session.options.set("hls-playlist-reload-time", "segment")  # Sync with segments
         self.session.options.set("hls-segment-queue-threshold", 5)  # Queue threshold
-        
+
         # Stream settings
         self.session.options.set("stream-timeout", 60)
         self.session.options.set("stream-segment-attempts", 5)
-        
+
         # Buffer settings
         self.session.options.set("ringbuffer-size", 128 * 1024 * 1024)  # 128MB buffer
         self.session.options.set("http-stream-timeout", 30)
-        
+
         # HTTP settings for Turkish CDNs
         self.session.options.set("http-query-param", "cachebust={timestamp}")
         self.session.options.set("http-headers", {
