@@ -155,15 +155,15 @@ class Dogan(Plugin):
         self.session.options.set("hls-segment-threads", 3)  # Parallel segment downloads
         self.session.options.set("hls-playlist-reload-time", "segment")  # Sync with segments
         self.session.options.set("hls-segment-queue-threshold", 4)
-        
+
         # Stream settings
         self.session.options.set("stream-timeout", 60)
         self.session.options.set("stream-segment-attempts", 4)
-        
+
         # Buffer management
         self.session.options.set("ringbuffer-size", 96 * 1024 * 1024)  # 96MB buffer
         self.session.options.set("http-stream-timeout", 35)
-        
+
         # HTTP headers optimized for Turkish CDNs
         self.session.set_option("http-headers", {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -176,7 +176,7 @@ class Dogan(Plugin):
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-site",
         })
-        
+
         # Specific for Dogan Group domains
         if "cnnturk.com" in self.url:
             self.session.options.set("http-query-param", "cachebust={timestamp}")
@@ -184,13 +184,13 @@ class Dogan(Plugin):
             # Kanal D often requires specific handling
             self.session.options.set("hls-live-edge", 12)
             self.session.options.set("ringbuffer-size", 128 * 1024 * 1024)
-        
+
         log.debug(f"Applied Turkish streaming optimizations for Dogan Group stream")
 
     def _get_streams(self):
         # Apply Turkish streaming optimizations
         self._configure_turkish_streaming()
-        
+
         root = self.session.http.get(self.url, schema=validate.Schema(validate.parse_html()))
 
         hls_url = self._get_hls_url(root)
@@ -210,10 +210,10 @@ class Dogan(Plugin):
                 hls_url += "&_t={timestamp}"
             else:
                 hls_url += "?_t={timestamp}"
-            
+
             # Log the HLS URL for debugging
             log.debug(f"HLS URL: {hls_url}")
-            
+
             try:
                 return HLSStream.parse_variant_playlist(
                     self.session, 
