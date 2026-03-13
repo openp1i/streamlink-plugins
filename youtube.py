@@ -409,11 +409,11 @@ class YouTube(Plugin):
         """Extract live video ID from channel page"""
         channel_url = self._url_channelid_live.format(channel_id=channel_id)
         log.debug(f"Resolving channel live page: {channel_url}")
-        
+
         try:
             res = self._get_res(channel_url)
             content = res.text
-            
+
             # Try multiple patterns to find the live video ID
             patterns = [
                 r'"videoId":"([\w-]{11})".*?"isLive":true',
@@ -423,7 +423,7 @@ class YouTube(Plugin):
                 r'href="/watch\?v=([\w-]{11})[^>]*>Live',
                 r'"videoId":"([\w-]{11})"'
             ]
-            
+
             for pattern in patterns:
                 match = re.search(pattern, content)
                 if match:
@@ -433,7 +433,7 @@ class YouTube(Plugin):
                     
             log.debug("No video ID found in channel page")
             return None
-            
+
         except Exception as e:
             log.error(f"Error fetching channel page: {e}")
             return None
@@ -518,10 +518,10 @@ class YouTube(Plugin):
                     fmt_url = fmt.get("url")
                     if not fmt_url:
                         continue
-                    
+
                     height = fmt.get("height", 0)
                     quality = f"{height}p" if height > 0 else fmt.get("format_note", "unknown")
-                    
+
                     if "m3u8" in fmt_url:
                         if is_live:
                             streams["live"] = HLSStream(
@@ -848,27 +848,27 @@ class YouTube(Plugin):
 
     def _get_streams(self):
         """Main method - hybrid approach with yt-dlp support"""
-        
+
         # Get match groups safely
         match_dict = self.match.groupdict() if self.match else {}
-        
+
         # Log which matcher matched
         if self.matches:
             matcher_names = [name for name in self.matches]
             log.debug(f"Matchers: {matcher_names}")
         if match_dict:
             log.debug(f"Match groups: {match_dict}")
-        
+
         # Check for channel live URLs first
         channel_id = match_dict.get("channel_id") or match_dict.get("channel")
         live_suffix = match_dict.get("live")
-        
+
         if channel_id and live_suffix:
             log.info(f"Channel live URL detected: {channel_id}")
-            
+
             # Try to get live video ID from channel
             resolved_video_id = self._get_channel_live_video_id(channel_id)
-            
+
             if resolved_video_id:
                 # Convert to watch URL and process normally
                 watch_url = self._url_canonical.format(video_id=resolved_video_id)
@@ -879,14 +879,14 @@ class YouTube(Plugin):
                 # Fall back to yt-dlp for live
                 log.info("Could not resolve live video ID, using yt-dlp")
                 return self._get_streams_ytdlp(self.url, is_live=True)
-        
+
         # Check for embed live URLs
         if "embed" in self.matches and match_dict.get("live_channel"):
             channel_id = match_dict.get("live_channel")
             log.info(f"Embed live URL detected: {channel_id}")
-            
+
             resolved_video_id = self._get_channel_live_video_id(channel_id)
-            
+
             if resolved_video_id:
                 watch_url = self._url_canonical.format(video_id=resolved_video_id)
                 log.info(f"Resolved to video: {watch_url}")
@@ -961,7 +961,7 @@ class YouTube(Plugin):
                 if streams:
                     return streams
                 return
-                
+
             status, reason = self._schema_playabilitystatus(data)
             # assume that there's an error if reason is set (status will still be "OK" for some reason)
             if status != "OK" or reason:
@@ -1021,7 +1021,7 @@ class YouTube(Plugin):
                     streams = self._get_streams_ytdlp(self.url)
 
             return streams
-            
+
         except Exception as e:
             log.error(f"Native method error: {e}")
             log.debug(traceback.format_exc())
